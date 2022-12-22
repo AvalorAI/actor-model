@@ -8,43 +8,62 @@ use tokio::sync::broadcast::{
 use super::{ActorError, Handle};
 
 /// A simple caching struct that can be used to locally maintain a synchronized state with an actor
+/// It used an inner cache so it can actually be cloned and constructed in without the use of async
 #[derive(Debug)]
 pub struct Cache<T> {
-    inner: Option<T>,
-    rx: broadcast::Receiver<T>,
-    has_listenend: bool,
+    inner_cache: Option<InnerCache<T>>,
+    handle: Handle<T>,
 }
 
 impl<T> Cache<T>
 where
     T: Clone + Debug + Send + Sync + 'static,
 {
-    pub(crate) async fn new(handle: Handle<T>) -> Result<Self, ActorError> {
-        let rx = handle.subscribe().await?;
-        let inner = Cache::initialize(&handle).await?;
-        Ok(Self {
-            inner,
-            rx,
-            has_listenend: false,
-        })
+    pub fn new(handle: Handle<T>) -> Cache<T> {
+        Cache {
+            inner_cache: None,
+            handle,
+        }
+    }
+
+    pub async fn new_initialized(handle: Handle<T>) -> Result<Cache<T>, ActorError> {
+        let mut cache = Cache {
+            inner_cache: None,
+            handle,
+        };
+        cache.initialize().await?;
+        Ok(cache)
+    }
+
+    pub async fn initialize(&mut self) -> Result<(), ActorError> {
+        self.inner_cache = Some(InnerCache::new(&self.handle).await?);
+        Ok(())
     }
 
     /// Returns the newest value available
     pub fn get_newest(&mut self) -> Result<Option<T>, ActorError> {
-        _ = self.try_listen_newest()?; // Update if possible
-        Ok(self.inner.clone())
+        let Some(cache) = &mut self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        cache.get_newest()
     }
 
     /// Returns the last value that is received in the cache
-    pub fn get_inner(&self) -> Option<T> {
-        self.inner.clone()
+    pub fn get_inner(&self) -> Result<Option<T>, ActorError> {
+        let Some(cache) = &self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        Ok(cache.get_inner())
     }
 
     /// Receive the newest updated value broadcasted by the actor, discarding any older messagesr.
     /// If the cache is called for the first time, a get is executed to see if the actor already contains a value.
     /// If the actor is empty or the cache is already initialized, it waits for any new updates.
     pub async fn listen_newest(&mut self) -> Result<T, ActorError> {
-        self._listen(true).await
+        let Some(cache) = &mut self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        cache.listen_newest().await
     }
 
     /// Receive the last updated value broadcasted by the actor.
@@ -52,6 +71,78 @@ where
     /// If the actor is empty or the cache is already initialized, it waits for any new updates (FIFO).
     /// A warning is printed if the channel is lagging behind (oldest messages discarded)
     pub async fn listen(&mut self) -> Result<T, ActorError> {
+        let Some(cache) = &mut self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        cache.listen().await
+    }
+
+    /// Try to receive the newest updated value broadcasted by the actor once, discarding any older messages.
+    /// If the cache is called for the first time, a get is executed to see if the actor already contains a value.
+    /// If the actor is empty or the cache is already initialized, it waits for any new updates.
+    pub fn try_listen_newest(&mut self) -> Result<Option<T>, ActorError> {
+        let Some(cache) = &mut self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        cache.try_listen_newest()
+    }
+
+    /// Try to receive the last updated value broadcasted by the actor once.
+    /// If the cache is called for the first time, a get is executed to see if the actor already contains a value.
+    /// If the actor is empty or the cache is already initialized, it waits for any new updates (FIFO).
+    /// A warning is printed if the channel is lagging behind (oldest messages discarded)
+    pub fn try_listen(&mut self) -> Result<Option<T>, ActorError> {
+        let Some(cache) = &mut self.inner_cache else {
+            return Err(ActorError::CacheUninitialized)
+        };
+        cache.try_listen()
+    }
+}
+
+impl<T> Clone for Cache<T>
+where
+    T: Clone + Debug + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Cache::new(self.handle.clone())
+    }
+}
+
+#[derive(Debug)]
+pub struct InnerCache<T> {
+    inner: Option<T>,
+    rx: broadcast::Receiver<T>,
+    has_listenend: bool,
+}
+
+impl<T> InnerCache<T>
+where
+    T: Clone + Debug + Send + Sync + 'static,
+{
+    pub(crate) async fn new(handle: &Handle<T>) -> Result<Self, ActorError> {
+        let rx = handle.subscribe().await?;
+        let inner = InnerCache::initialize(&handle).await?;
+        Ok(Self {
+            inner,
+            rx,
+            has_listenend: false,
+        })
+    }
+
+    fn get_newest(&mut self) -> Result<Option<T>, ActorError> {
+        _ = self.try_listen_newest()?; // Update if possible
+        Ok(self.inner.clone())
+    }
+
+    fn get_inner(&self) -> Option<T> {
+        self.inner.clone()
+    }
+
+    async fn listen_newest(&mut self) -> Result<T, ActorError> {
+        self._listen(true).await
+    }
+
+    async fn listen(&mut self) -> Result<T, ActorError> {
         self._listen(false).await
     }
 
@@ -97,18 +188,11 @@ where
         }
     }
 
-    /// Try to receive the newest updated value broadcasted by the actor once, discarding any older messages.
-    /// If the cache is called for the first time, a get is executed to see if the actor already contains a value.
-    /// If the actor is empty or the cache is already initialized, it waits for any new updates.
-    pub fn try_listen_newest(&mut self) -> Result<Option<T>, ActorError> {
+    fn try_listen_newest(&mut self) -> Result<Option<T>, ActorError> {
         self._try_listen(true)
     }
 
-    /// Try to receive the last updated value broadcasted by the actor once.
-    /// If the cache is called for the first time, a get is executed to see if the actor already contains a value.
-    /// If the actor is empty or the cache is already initialized, it waits for any new updates (FIFO).
-    /// A warning is printed if the channel is lagging behind (oldest messages discarded)
-    pub fn try_listen(&mut self) -> Result<Option<T>, ActorError> {
+    fn try_listen(&mut self) -> Result<Option<T>, ActorError> {
         self._try_listen(false)
     }
 
@@ -168,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn test_listen_cache() {
         let handle = Handle::new_from(1);
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         _ = cache.listen().await.unwrap(); // First listen returns 10
         handle.set(2).await.unwrap();
         handle.set(3).await.unwrap(); // Not updated yet, as returning oldest value first
@@ -178,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn test_listen_cache_newest() {
         let handle = Handle::new_from(1);
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         handle.set(2).await.unwrap();
         handle.set(3).await.unwrap();
         assert_eq!(cache.listen_newest().await.unwrap(), 3)
@@ -187,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_immediate_cache_return() {
         let handle = Handle::new_from(1);
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         handle.set(2).await.unwrap(); // Not updated yet, as returning oldest value first
         assert_eq!(cache.listen().await.unwrap(), 1)
     }
@@ -195,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_immediate_cache_return_with_newest() {
         let handle = Handle::new_from(1);
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         handle.set(2).await.unwrap(); // Try to check for any newer
         assert_eq!(cache.listen_newest().await.unwrap(), 2)
     }
@@ -203,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_delayed_cache_return() {
         let handle = Handle::new();
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
 
         let res = tokio::select! {
             _ = async {
@@ -220,14 +304,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_listen_none() {
         let handle = Handle::<i32>::new();
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         assert!(cache.try_listen().unwrap().is_none())
     }
 
     #[tokio::test]
     async fn test_try_listen_some() {
         let handle = Handle::new();
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         handle.set(2).await.unwrap(); // Not updated yet, as returning oldest value first
         handle.set(3).await.unwrap();
         assert_eq!(cache.try_listen().unwrap(), Some(2))
@@ -236,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_listen_some_newest() {
         let handle = Handle::new();
-        let mut cache = handle.create_cache().await.unwrap();
+        let mut cache = handle.create_initialized_cache().await.unwrap();
         handle.set(2).await.unwrap();
         handle.set(3).await.unwrap();
         assert_eq!(cache.try_listen_newest().unwrap(), Some(3))

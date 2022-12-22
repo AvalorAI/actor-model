@@ -19,8 +19,12 @@ impl<T> Handle<T>
 where
     T: Clone + Debug + Send + Sync + 'static,
 {
-    pub async fn create_cache(&self) -> Result<Cache<T>, ActorError> {
-        Cache::new(self.clone()).await
+    pub fn create_cache(&self) -> Cache<T> {
+        Cache::new(self.clone())
+    }
+
+    pub async fn create_initialized_cache(&self) -> Result<Cache<T>, ActorError> {
+        Cache::new_initialized(self.clone()).await
     }
 
     pub fn capacity(&self) -> usize {

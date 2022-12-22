@@ -30,6 +30,8 @@ pub enum ActorError {
     TokioBroadcastRecvError(#[from] broadcast::error::RecvError),
     #[error("An incorrect response type for this method has been received")]
     WrongResponse,
+    #[error("The cache has not yet been initialized")]
+    CacheUninitialized,
 }
 
 impl<T> From<mpsc::error::SendError<T>> for ActorError {
